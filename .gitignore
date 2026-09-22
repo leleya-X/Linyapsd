@@ -1,0 +1,5 @@
+.zig-cache/
+zig-out/
+
+# 静态依赖的源码与构建产物，用 tools/build-deps.sh 重建
+vendor/
