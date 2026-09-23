@@ -32,6 +32,7 @@
 | `Ping` | `() -> s` | 返回 `pong` |
 | `Version` | `() -> s` | 版本号 |
 | `ReadStates` | `() -> s` | 宿主 `/var/lib/linglong/states.json` 全文 |
+| `ReadEntries` | `() -> a(ssay)` | 宿主导出的桌面条目，每项 `(应用 ID, desktop 全文, 图标字节)` |
 | `ExecLlCli` | `as -> iss` | 跑 ll-cli 只读子命令，返回 `(退出码, stdout, stderr)` |
 | `Quit` | `() -> s` | 让本实例退出，下次调用由 bus 重新拉起 |
 
@@ -39,6 +40,15 @@
 
 `ExecLlCli` 只接受白名单子命令：`list`、`info`、`search`、`ps`。
 不经过 shell，参数原样交给 `execv`，所以不存在命令注入；白名单挡的是不该被远程触发的子命令。
+
+`ReadEntries` 读的是 `/var/lib/linglong/entries/share/{applications,icons}`，
+也就是启动器看到的那份导出。应用 ID 只认 desktop 里的 `X-linglong`：
+文件名靠不住（`drawio.desktop` 对应 `net.diagrams.drawio`、`qq.desktop` 对应 `linux.qq.com`），
+没有这个字段的条目不是玲珑装出来的，不会出现在回复里。
+图标按 `Icon=` 去 hicolor 主题里逐档找，从 256x256 起（界面在 50 到 160 逻辑像素上用，
+HiDPI 还要再乘 2），位图都没有才退回 scalable。
+**找不到图标回的是空字节数组**，那表示这个应用没有出主题图标，
+和"读取失败"不是一回事 —— 后者会以 D-Bus 错误回出去。
 
 命令行上还认两个参数：
 

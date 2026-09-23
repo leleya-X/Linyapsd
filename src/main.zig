@@ -17,6 +17,9 @@ const c = @cImport({
     @cInclude("unistd.h");
     @cInclude("sys/wait.h");
     @cInclude("signal.h");
+    // 遍历宿主导出目录用 opendir/readdir。Zig 0.16 的 std.fs 已经并进 std.Io，
+    // 那套每调一次都要传一个 Io 实例进来，而本程序只用得到"打开、读、关"这几下
+    @cInclude("dirent.h");
 });
 
 /// 单调时钟的毫秒数，用来量"等了多久"。
@@ -44,6 +47,11 @@ const version_z: [:0]const u8 = version ++ "";
 const states_path = "/var/lib/linglong/states.json";
 const ll_cli = "/usr/bin/ll-cli";
 
+/// 玲珑把每个已安装应用的 share/{applications,icons} 链到这里，
+/// 宿主的 XDG_DATA_DIRS 里有这条路径，容器里没有 —— 和 states.json 同理。
+const entries_apps = "/var/lib/linglong/entries/share/applications";
+const entries_icons = "/var/lib/linglong/entries/share/icons/hicolor";
+
 /// 允许经 D-Bus 触发的 ll-cli 子命令。全是只读查询，
 /// 挡的是 uninstall/install 这类会改系统状态的。
 const ll_allowed = [_][]const u8{ "list", "info", "search", "ps" };
@@ -51,11 +59,25 @@ const ll_allowed = [_][]const u8{ "list", "info", "search", "ps" };
 const max_states = 8 * 1024 * 1024;
 const max_output = 8 * 1024 * 1024;
 
+/// 单个 desktop 文件的上限。桌面条目就是几十行字，正常几百字节；
+/// 超了说明这个文件不是桌面条目，如实报错而不是截断着用。
+const max_desktop = 64 * 1024;
+/// 单张图标的上限。按下面的偏好取到的是 256x256 那一档，正常几十 KB；
+/// 留到 4 MB 是给 1024x1024 那些留的余量。
+const max_icon = 4 * 1024 * 1024;
+/// 应用 ID 与图标名的上限。两者都是短标识，超了就是这个条目本身有问题。
+const max_name = 256;
+
 // 缓冲放 .bss，不占二进制体积。末尾那一字节留给 NUL，
 // 因为 libdbus 追加字符串时靠 strlen 定长。
 var states_buf: [max_states]u8 = undefined;
 var out_buf: [max_output]u8 = undefined;
 var err_buf: [64 * 1024]u8 = undefined;
+var desktop_buf: [max_desktop]u8 = undefined;
+var icon_buf: [max_icon]u8 = undefined;
+/// 从 desktop 文本里取出来的应用 ID，抄一份补上 NUL 才能交给 libdbus。
+/// 不能就地改 desktop_buf：那个 ID 前后还有别的内容，改了就把全文弄坏了
+var appid_buf: [max_name]u8 = undefined;
 
 pub fn main(init: std.process.Init.Minimal) u8 {
     // 部署方要拿这个版本号跟落点上那份比，决定要不要覆盖（见 host_bridge.dart）
@@ -246,6 +268,8 @@ fn dispatch(conn: dbus.Connection, call: dbus.Incoming) dbus.Error!bool {
         try replyString(conn, call, version_z);
     } else if (std.mem.eql(u8, member, "ReadStates")) {
         try handleReadStates(conn, call);
+    } else if (std.mem.eql(u8, member, "ReadEntries")) {
+        try handleReadEntries(conn, call);
     } else if (std.mem.eql(u8, member, "ExecLlCli")) {
         try handleExecLlCli(conn, call);
     } else if (std.mem.eql(u8, member, "Quit")) {
@@ -305,6 +329,196 @@ fn handleReadStates(conn: dbus.Connection, call: dbus.Incoming) dbus.Error!void 
     defer r.discard();
     try dbus.putString(&r, states_buf[0..len :0]);
     return dbus.sendReply(conn, &r);
+}
+
+/// 读宿主导出的桌面条目与图标，回 a(ssay)：每项是 (应用 ID, desktop 全文, 图标字节)。
+///
+/// 玲珑把每个已安装应用的 share/{applications,icons} 链到
+/// /var/lib/linglong/entries/share 下，宿主的 XDG_DATA_DIRS 里有这条路径，
+/// 容器里没有 —— 于是应用列表的图标只能去问玲珑商店，商店不认的包
+/// （本地构建、侧载的）就只剩一张通用图标。这份数据在宿主上现成，读出来即可。
+fn handleReadEntries(conn: dbus.Connection, call: dbus.Incoming) dbus.Error!void {
+    const dir = c.opendir(entries_apps) orelse {
+        var buf: [512]u8 = undefined;
+        const text = std.fmt.bufPrint(&buf, "宿主上打不开 {s}: {s}", .{
+            entries_apps,
+            @tagName(std.c.errno(-1)),
+        }) catch "宿主上打不开桌面条目目录";
+        return dbus.replyError(conn, call, "org.freedesktop.DBus.Error.FileNotFound", text);
+    };
+    defer _ = c.closedir(dir);
+
+    var r = try dbus.newReply(call);
+    defer r.discard();
+    const list = dbus.root(&r);
+
+    var array: dbus.Iter = undefined;
+    try dbus.openArray(list, &array, "(ssay)");
+
+    while (c.readdir(dir)) |ent| {
+        const name = std.mem.span(@as([*:0]const u8, @ptrCast(&ent.*.d_name)));
+
+        // 目录里还有 mimeinfo.cache 这类东西，只认桌面条目
+        if (!std.mem.endsWith(u8, name, ".desktop")) continue;
+
+        const text = readDesktop(name) catch |e|
+            return replyFsError(conn, call, name, e);
+
+        // 应用 ID 只认 X-linglong：文件名靠不住（drawio.desktop 对应的是
+        // net.diagrams.drawio、qq.desktop 对应的是 linux.qq.com），
+        // 这个字段是玲珑安装时写进去的。没有它的条目不是玲珑装出来的，
+        // 不往回复里塞 —— 塞了调用方也没法把它认领到哪个应用上
+        const appid_raw = desktopValue(text, "X-linglong") orelse continue;
+        const appid = copyZ(&appid_buf, appid_raw) catch |e|
+            return replyFsError(conn, call, name, e);
+
+        // 应用没写 Icon= 就没有图标，findIcon 会直接给空
+        const icon_name = desktopValue(text, "Icon") orelse "";
+        const icon = findIcon(icon_name) catch |e|
+            return replyFsError(conn, call, name, e);
+
+        var record: dbus.Iter = undefined;
+        try dbus.openStruct(&array, &record);
+        try dbus.putStringI(&record, appid);
+        try dbus.putStringI(&record, text);
+        var bytes: dbus.Iter = undefined;
+        try dbus.openArray(&record, &bytes, "y");
+        try dbus.putBytes(&bytes, icon);
+        try dbus.closeContainer(&record, &bytes);
+        try dbus.closeContainer(&array, &record);
+    }
+
+    try dbus.closeContainer(list, &array);
+    return dbus.sendReply(conn, &r);
+}
+
+/// 把文件系统错误如实回给调用方，带上出错的路径 —— 只说一句"读取失败"，
+/// 调用方没法知道是哪个文件、错在哪。
+fn replyFsError(conn: dbus.Connection, call: dbus.Incoming, what: []const u8, e: anyerror) dbus.Error!void {
+    var buf: [512]u8 = undefined;
+    const text = std.fmt.bufPrint(&buf, "读 {s} 失败: {s}", .{ what, @errorName(e) }) catch "读宿主导出的桌面条目失败";
+    return dbus.replyError(conn, call, "org.freedesktop.DBus.Error.Failed", text);
+}
+
+/// 读一个桌面条目到 desktop_buf，末尾补 NUL（libdbus 追加字符串按 strlen 定长，
+/// 而这个切片要当字符串回给调用方）。返回的切片指向那个缓冲，下一轮会被覆盖 ——
+/// 所以取出来的 X-linglong / Icon 要在本轮里用掉。
+fn readDesktop(name: []const u8) ![:0]const u8 {
+    var path_buf: [512]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, "{s}/{s}", .{ entries_apps, name });
+
+    // 末尾留一个字节给 NUL
+    const n = try readWholeFile(path, desktop_buf[0 .. desktop_buf.len - 1]);
+    desktop_buf[n] = 0;
+    return desktop_buf[0..n :0];
+}
+
+/// 把整个文件读进 buf，返回读到的字节数。
+/// 大小在打开后就核一次：超了直接报错，不截断 —— 半截 desktop 解析出来的东西
+/// 没人能信任，而调用方也没法从结果里看出被截过。
+fn readWholeFile(path: [*:0]const u8, buf: []u8) !usize {
+    const file = std.c.open(path, .{ .ACCMODE = .RDONLY });
+    if (file < 0) return switch (std.c.errno(file)) {
+        .NOENT => error.FileNotFound,
+        else => error.OpenFailed,
+    };
+    defer _ = c.close(file);
+
+    const end = c.lseek(file, 0, c.SEEK_END);
+    if (end < 0) return error.SeekFailed;
+    const len: usize = @intCast(end);
+    if (len > buf.len) return error.FileTooBig;
+    _ = c.lseek(file, 0, c.SEEK_SET);
+
+    var got: usize = 0;
+    while (got < len) {
+        const n = c.read(file, buf[got..].ptr, len - got);
+        if (n <= 0) break;
+        got += @intCast(n);
+    }
+    // 读到的比该有的少，就是这次读坏了。宁可报错也不当完整文件用
+    if (got != len) return error.ShortRead;
+    return len;
+}
+
+/// 在 desktop 文本里取 [Desktop Entry] 组下某个键的值。
+/// 只认那一个组：desktop 文件可以有多组，同名键出现在别的组里不算数。
+fn desktopValue(text: []const u8, key: []const u8) ?[]const u8 {
+    var in_entry = false;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |raw_line| {
+        // 行尾可能带 CR —— 这些文件是各家包里的，作者在哪个系统上编的都有
+        const line = std.mem.trimEnd(u8, raw_line, "\r");
+        if (line.len == 0) continue;
+        if (line[0] == '[') {
+            in_entry = std.mem.eql(u8, line, "[Desktop Entry]");
+            continue;
+        }
+        if (!in_entry or line[0] == '#') continue;
+        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        if (std.mem.eql(u8, line[0..eq], key)) {
+            return std.mem.trim(u8, line[eq + 1 ..], " \t");
+        }
+    }
+    return null;
+}
+
+/// 图标尺寸的查找顺序。界面在 50 逻辑像素（列表）到 160（详情）上用它们，
+/// HiDPI 下还要再乘 2，所以从 256 起步；后面的档位留给没出 256 的包。
+/// 这不是碰运气：主题目录本来就按尺寸分档，顺序定死，每一档的含义唯一。
+const icon_sizes = [_][]const u8{
+    "256x256", "128x128", "512x512", "192x192", "96x96",
+    "64x64",   "48x48",   "32x32",   "24x24",   "16x16",
+    "22x22",   "720x720", "1024x1024",
+};
+
+/// 按 desktop 里的 Icon= 找图标，返回字节。找不到返回空切片 ——
+/// 那表示这个应用没有主题图标（界面会退回通用图标），不是读取失败。
+fn findIcon(icon_name: []const u8) ![]const u8 {
+    // desktop 规范允许 Icon= 直接写路径。那种图标在包内，导出目录里没有，
+    // 不在这儿猜它对应哪个主题名
+    if (icon_name.len == 0 or std.mem.indexOfScalar(u8, icon_name, '/') != null) {
+        return icon_buf[0..0];
+    }
+
+    var path_buf: [512]u8 = undefined;
+    for (icon_sizes) |size| {
+        const path = std.fmt.bufPrintZ(
+            &path_buf,
+            "{s}/{s}/apps/{s}.png",
+            .{ entries_icons, size, icon_name },
+        ) catch continue;
+        if (try readIcon(path)) |bytes| return bytes;
+    }
+
+    // 各档位图都没有，再看矢量图。放最后：位图能直接画，
+    // 矢量图要调用方另走一条渲染路径
+    const svg = std.fmt.bufPrintZ(
+        &path_buf,
+        "{s}/scalable/apps/{s}.svg",
+        .{ entries_icons, icon_name },
+    ) catch return icon_buf[0..0];
+    if (try readIcon(svg)) |bytes| return bytes;
+    return icon_buf[0..0];
+}
+
+/// 读一张图标到 icon_buf。文件不存在返回 null —— 那是"这个应用没有这一档图标"，
+/// 往下试下一档就是了；其余错误照旧往上抛，不能把"读不了"混成"没有"。
+fn readIcon(path: [*:0]const u8) !?[]const u8 {
+    const n = readWholeFile(path, &icon_buf) catch |e| switch (e) {
+        error.FileNotFound => return null,
+        else => return e,
+    };
+    return icon_buf[0..n];
+}
+
+/// 把切片抄成 NUL 结尾的字符串，借调用方的缓冲存放。
+/// 超长直接报错：应用 ID 和图标名都是短标识，超了说明这个条目本身有问题。
+fn copyZ(buf: []u8, s: []const u8) ![:0]const u8 {
+    if (s.len >= buf.len) return error.NameTooLong;
+    @memcpy(buf[0..s.len], s);
+    buf[s.len] = 0;
+    return buf[0..s.len :0];
 }
 
 /// 跑一个白名单内的 ll-cli 子命令，回 (退出码, stdout, stderr)。

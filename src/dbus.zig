@@ -224,10 +224,19 @@ fn readNameOwnerChanged(msg: *c.DBusMessage, out: *NameOwnerChanged) Error!void 
 
 // ------------------------------------------------------------------ 发回复
 
+/// 追加用的迭代器句柄。所有追加都经过它，Reply 里存的就是根那一个。
+///
+/// 它只在调用方开好的变量里存在，一路传指针、不复制：libdbus 的迭代器
+/// 里存着"下一次追加落在哪"，复制一份再往副本里追加，原件的位置就停在旧处，
+/// 之后由原件继续装数据会装错地方。
+pub const Iter = struct {
+    c_it: c.DBusMessageIter,
+};
+
 /// 边构造边追加的实现句柄。
 pub const Reply = struct {
     msg: *c.DBusMessage,
-    it: c.DBusMessageIter,
+    it: Iter,
 
     pub fn discard(self: *Reply) void {
         c.dbus_message_unref(self.msg);
@@ -236,22 +245,86 @@ pub const Reply = struct {
 
 pub fn newReply(call: Incoming) Error!Reply {
     const msg = c.dbus_message_new_method_return(call.msg) orelse return Error.IoFailed;
-    var it: c.DBusMessageIter = undefined;
-    c.dbus_message_iter_init_append(msg, &it);
+    var it: Iter = .{ .c_it = undefined };
+    c.dbus_message_iter_init_append(msg, &it.c_it);
     return .{ .msg = msg, .it = it };
+}
+
+/// 取 Reply 的根迭代器，用来往外开容器（数组套结构体这种）。
+/// 返回的是 Reply 里那一个本身，不复制 —— 复制的后果见 Iter 的说明。
+pub fn root(r: *Reply) *Iter {
+    return &r.it;
 }
 
 /// 追加一个字符串。libdbus 靠 strlen 定长，所以必须是 NUL 结尾的。
 pub fn putString(r: *Reply, s: [:0]const u8) Error!void {
-    var p: [*c]const u8 = s.ptr;
-    if (c.dbus_message_iter_append_basic(&r.it, c.DBUS_TYPE_STRING, @ptrCast(&p)) == 0) {
-        return Error.TooLarge;
-    }
+    return putStringI(&r.it, s);
 }
 
 pub fn putInt32(r: *Reply, value: i32) Error!void {
     var v: c.dbus_int32_t = value;
-    if (c.dbus_message_iter_append_basic(&r.it, c.DBUS_TYPE_INT32, @ptrCast(&v)) == 0) {
+    if (c.dbus_message_iter_append_basic(&r.it.c_it, c.DBUS_TYPE_INT32, @ptrCast(&v)) == 0) {
+        return Error.TooLarge;
+    }
+}
+
+/// 往指定迭代器里追加一个字符串，容器内部用它。
+pub fn putStringI(it: *Iter, s: [:0]const u8) Error!void {
+    var p: [*c]const u8 = s.ptr;
+    if (c.dbus_message_iter_append_basic(&it.c_it, c.DBUS_TYPE_STRING, @ptrCast(&p)) == 0) {
+        return Error.TooLarge;
+    }
+}
+
+/// 往指定迭代器里追加一个字节数组（签名 y），也就是一个 ay 容器的内容。
+/// 必须已经用 openArray(it, &sub, "y") 开好了那个容器，子迭代器传进来。
+///
+/// 注意第三个参数要的是**指针变量的地址**，不是数据本身的地址：
+/// libdbus 收下后会按 `const unsigned char *const *` 再解一层
+/// （_dbus_marshal_write_fixed_multi 里就是 *u8_pp）。
+/// 直接把数据地址传进去，它就把头几个字节当成指针去 memmove —— 当场段错误，
+/// 而且崩在库里，从调用点完全看不出是这里传错了。所以先放进一个局部变量再取址。
+pub fn putBytes(it: *Iter, bytes: []const u8) Error!void {
+    var p: [*c]const u8 = bytes.ptr;
+    if (c.dbus_message_iter_append_fixed_array(
+        &it.c_it,
+        c.DBUS_TYPE_BYTE,
+        @ptrCast(&p),
+        @intCast(bytes.len),
+    ) == 0) {
+        return Error.TooLarge;
+    }
+}
+
+/// 在 parent 上开一个数组容器，子迭代器写进 child。
+/// elem_sig 是元素的签名（"s"、"(ssay)" 这种）。
+pub fn openArray(parent: *Iter, child: *Iter, elem_sig: [*:0]const u8) Error!void {
+    if (c.dbus_message_iter_open_container(
+        &parent.c_it,
+        c.DBUS_TYPE_ARRAY,
+        elem_sig,
+        &child.c_it,
+    ) == 0) {
+        return Error.TooLarge;
+    }
+}
+
+/// 在 parent 上开一个结构体容器。签名由里面装了什么决定，这里不写。
+pub fn openStruct(parent: *Iter, child: *Iter) Error!void {
+    if (c.dbus_message_iter_open_container(
+        &parent.c_it,
+        c.DBUS_TYPE_STRUCT,
+        null,
+        &child.c_it,
+    ) == 0) {
+        return Error.TooLarge;
+    }
+}
+
+/// 关掉 child 那个容器，回到 parent。
+/// 容器必须严格嵌套着开合 —— libdbus 靠这个把长度和补齐写进消息头。
+pub fn closeContainer(parent: *Iter, child: *Iter) Error!void {
+    if (c.dbus_message_iter_close_container(&parent.c_it, &child.c_it) == 0) {
         return Error.TooLarge;
     }
 }
