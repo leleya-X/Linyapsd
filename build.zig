@@ -35,7 +35,19 @@ fn readZonVersion(b: *std.Build) []const u8 {
 
 pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
-    const target = b.standardTargetOptions(.{});
+
+    // 默认按 musl 编，不跟宿主的 glibc 走。
+    //
+    // 静态链 glibc 也能得到「不依赖宿主任何 .so」的产物，但 glibc 会把
+    // NSS、locale、gconv、getaddrinfo 那一整套一并链进来 —— 现在一个都不
+    // 调，所以看不出问题；等哪天代码里多一次 getpwuid() 或 setlocale()，
+    // 就会在别人机器上运行时静默失败（NSS 模块 dlopen 不到、locale 读不到），
+    // 而开发机上永远复现不了。musl 没有这层包袱。
+    //
+    // 显式传 -Dtarget=... 时仍以传进来的为准，这里只管默认值。
+    const target = b.standardTargetOptions(.{
+        .default_target = .{ .abi = .musl },
+    });
 
     // libdbus 和它的依赖 expat 都是随包静态带上的，见 tools/build-deps.sh。
     // 用源码而不是系统的 libdbus-1.so，是为了让产物不依赖宿主的任何共享库。
@@ -68,7 +80,7 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addObjectFile(dbus_static);
     exe.root_module.addObjectFile(expat_static);
 
-    // 静态链接 libc：产物不挑宿主 glibc 版本，也没有任何 .so 依赖
+    // 静态链接 libc：产物不带任何 .so 依赖，也不挑宿主的 libc
     exe.linkage = .static;
 
     b.installArtifact(exe);

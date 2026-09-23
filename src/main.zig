@@ -17,16 +17,18 @@ const c = @cImport({
     @cInclude("unistd.h");
     @cInclude("sys/wait.h");
     @cInclude("signal.h");
-    @cInclude("time.h");
 });
 
 /// 单调时钟的毫秒数，用来量"等了多久"。
 /// 不用墙上时钟：它会被系统对时往回拨，把等待算成负数。
 fn monotonicMs() i64 {
-    var ts: c.struct_timespec = undefined;
+    // timespec 取自 std.c，不用本文件 @cImport 出来的那个：musl 的 time.h
+    // 经 translate-c 之后 struct timespec 只剩一句 opaque 声明，在它上面
+    // 开变量编不过。std.c 这份由 Zig 自己维护，两种 libc 下都是完整结构体。
+    var ts: std.c.timespec = undefined;
     // CLOCK_MONOTONIC 是内核保证不会失败的时钟
-    _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
-    return @as(i64, ts.tv_sec) * 1000 + @divTrunc(@as(i64, ts.tv_nsec), std.time.ns_per_ms);
+    _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
+    return @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), std.time.ns_per_ms);
 }
 
 const bus_name = "io.github.leleya_x.Linyapsd";

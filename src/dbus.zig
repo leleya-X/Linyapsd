@@ -68,10 +68,14 @@ pub const Connection = *c.DBusConnection;
 
 /// 连上 session bus，自己完成 Hello 和 SASL 握手。
 ///
-/// 地址一律听总线环境的：bus 激活我们时会把 DBUS_SESSION_BUS_ADDRESS
+/// 地址听总线环境的：bus 激活我们时会把 DBUS_SESSION_BUS_ADDRESS
 /// （容器里玲珑设成宿主 bus 的 socket）放在环境里，libdbus 自己会读。
-/// 读不到就说明环境不对，直接报错退出 —— 不去猜 XDG_RUNTIME_DIR 之类的路径，
-/// 猜错了会连上一个不是调用方所在的总线，比失败更难查。
+///
+/// 但别指望变量缺失时会在这儿失败 —— libdbus 不报错，它回退到默认的
+/// unix:path=$XDG_RUNTIME_DIR/bus，也就是一条"本机自己的"总线，而不是
+/// 调用方所在的那条。那条上多半没有我们要服务的人，连接却可能是通的，
+/// 于是失败被推给调用方，表现为一个空结果。环境对不对最终得靠部署方把
+/// 变量设对，这里拦不住。
 pub fn connectSessionBus() Error!*c.DBusConnection {
     c.dbus_error_init(errPtr());
     const conn = c.dbus_bus_get_private(c.DBUS_BUS_SESSION, errPtr()) orelse

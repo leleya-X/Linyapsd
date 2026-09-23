@@ -82,8 +82,11 @@ linyapsd              # 正常提供服务
 ```bash
 ./tools/build-deps.sh          # 编静态依赖，只需跑一次
 zig build -Doptimize=ReleaseSmall
-# 产物：zig-out/bin/linyapsd，约 1.6 MB，statically linked
+# 产物：zig-out/bin/linyapsd，约 500 KB，statically linked
 ```
+
+`zig build` 默认按 **musl** 编（`build.zig` 里的默认 target），不跟宿主的
+libc 走；显式传 `-Dtarget=...` 时以传进去的为准。理由见下面「[为什么按 musl 编](#为什么按-musl-编)」。
 
 ### 为什么要自己编依赖
 
@@ -99,6 +102,28 @@ zig build -Doptimize=ReleaseSmall
 
 库和源码都在 `vendor/` 下，已 gitignore，随时可以删掉重来。
 脚本用项目内的虚拟环境装 meson，系统的 python 环境不受影响。
+
+**这两个库也得按 musl 编。** 它们是最终产物的一部分，用宿主那套 glibc 的
+gcc 编出来的 `.a` 链不进 musl 程序。所以脚本不用宿主编译器，而是把
+`zig cc -target <arch>-linux-musl` 包一层当 CC/CXX/AR —— zig 自带头文件和
+libc，不需要另外装 sysroot 或 musl-gcc。换工具链整个重编，脚本里有个
+stamp 记着上次用的 triple，对不上就把旧产物丢掉重来，免得 glibc 和 musl
+的 `.a` 混着用。
+
+### 为什么按 musl 编
+
+「静态链接」本身只保证产物不带 `.so` 依赖，不保证它不依赖宿主的**数据**。
+glibc 的静态库会把 NSS、locale、gconv、DNS 那一整套一起链进去：现在一个都
+不调，所以看不出问题；等哪天代码里多一次 `getpwuid()` 或 `setlocale()`，
+静态 glibc 下就会在运行时静默失败（它要去 dlopen `libnss_*.so.2`，而静态
+程序没有那个动态加载环境），locale、时区同理。这种坑在开发机上永远复现不了，
+只有拿到别的机器上才炸。
+
+musl 没有这层包袱：对应的功能都是直接读文件（`/etc/passwd`、`/usr/share/zoneinfo`），
+读不到就是读不到，不会在运行时去找共享库。代价是产物对这些文件的位置有硬编码，
+但它们本来就是「装了 D-Bus 的 Linux」的同义词。
+
+顺带产物也从 1.5 MB 缩到 500 KB —— glibc 那套整块链进来的东西本来就没用上。
 
 ### D-Bus 协议用 libdbus，不自己实现
 
@@ -185,12 +210,7 @@ SIGHUP 走的是 `launcher_reload_config()`，只重新读配置、重新扫描�
 
 同一份 `linyapsd` 在两种实现下都能工作 —— libdbus 会处理这两种情况。
 **可移植性只取决于架构相同、且 host 上有 D-Bus**：库都静态链进产物了，
-宿主的 glibc 版本、有没有 libdbus、有没有 systemd 都不影响。
-
-**连接地址不自作主张。** 被激活时总线地址由 bus 通过环境变量给出
-（`DBUS_SESSION_BUS_ADDRESS`，容器里玲珑指向宿主的 socket），
-读不到就是环境不对，直接报错退出 —— 不会去猜 `XDG_RUNTIME_DIR` 之类的路径，
-猜错了会接到一条不是调用方所在的总线上，比直接失败难查得多。
+宿主的 libc 版本、有没有 libdbus、有没有 systemd 都不影响。
 
 **出错不静默。** ll-cli 输出超出缓冲、D-Bus 回复发不出去，都会如实报错，
 而不是截断后当完整结果返回、或让调用方一直干等到超时。
