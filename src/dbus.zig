@@ -20,11 +20,6 @@ pub const Error = error{
     Malformed,
 };
 
-/// ll-cli 参数个数上限，main.zig 要按它开缓冲区
-pub const max_args = 16;
-/// 单个参数长度上限
-const max_arg_len = 512;
-
 /// translate-c 一碰到 DBusError 里的位域就把整个结构体退化成了 opaque，
 /// 只能照 C 的 ABI 自己摆一份：两个指针 + 一个塞了 5 个位域的 unsigned int
 /// + 一个补齐的 void*。传进 libdbus 时再 @ptrCast 回 *c.DBusError。
@@ -261,13 +256,6 @@ pub fn putString(r: *Reply, s: [:0]const u8) Error!void {
     return putStringI(&r.it, s);
 }
 
-pub fn putInt32(r: *Reply, value: i32) Error!void {
-    var v: c.dbus_int32_t = value;
-    if (c.dbus_message_iter_append_basic(&r.it.c_it, c.DBUS_TYPE_INT32, @ptrCast(&v)) == 0) {
-        return Error.TooLarge;
-    }
-}
-
 /// 往指定迭代器里追加一个字符串，容器内部用它。
 pub fn putStringI(it: *Iter, s: [:0]const u8) Error!void {
     var p: [*c]const u8 = s.ptr;
@@ -362,42 +350,26 @@ pub fn replyError(
 
 // ------------------------------------------------------------------ 读参数
 
-/// ExecLlCli 收到的 as 参数，内容拷进自己的存储，脱离 libdbus 的缓冲。
-pub const ArgList = struct {
-    storage: [max_args][max_arg_len]u8 = undefined,
-    args: [max_args][]const u8 = undefined,
-    len: usize = 0,
-
-    pub fn slice(self: *const ArgList) []const []const u8 {
-        return self.args[0..self.len];
-    }
-};
-
-pub fn readStringArray(call: Incoming, out: *ArgList) Error!void {
+/// 读一个字符串参数，内容拷进调用方给的缓冲，脱离 libdbus 的数据。
+/// 返回的切片带 NUL 结尾，可以直接交给 execv。
+///
+/// 只认"恰好一个字符串"：没有参数、第一个不是字符串、后面还跟着别的参数，
+/// 一律按畸形拒掉。不做"取头一个、其余不管"这种宽容处理 —— 那样会把一个
+/// 自己并没读懂的消息当成合法的执行请求。
+pub fn readSingleString(call: Incoming, buf: []u8) Error![:0]const u8 {
     var it: c.DBusMessageIter = undefined;
     if (c.dbus_message_iter_init(call.msg, &it) == 0) return Error.Malformed;
-    if (c.dbus_message_iter_get_arg_type(&it) != c.DBUS_TYPE_ARRAY) return Error.Malformed;
+    if (c.dbus_message_iter_get_arg_type(&it) != c.DBUS_TYPE_STRING) return Error.Malformed;
 
-    var sub: c.DBusMessageIter = undefined;
-    c.dbus_message_iter_recurse(&it, &sub);
-    while (c.dbus_message_iter_get_arg_type(&sub) != c.DBUS_TYPE_INVALID) {
-        // 参数只接受字符串数组。别的元素类型一律当畸形输入拒掉，
-        // 不做"跳过看不懂的部分、能读多少算多少"这种宽容处理 ——
-        // 那样会把一个残缺的参数表当成完整的交给 ll-cli。
-        if (c.dbus_message_iter_get_arg_type(&sub) != c.DBUS_TYPE_STRING) return Error.Malformed;
-        if (out.len >= max_args) return Error.TooLarge;
+    var p: [*c]const u8 = undefined;
+    c.dbus_message_iter_get_basic(&it, @ptrCast(&p));
+    const s = span(p);
 
-        var p: [*c]const u8 = undefined;
-        c.dbus_message_iter_get_basic(&sub, @ptrCast(&p));
-        const s = span(p);
-        if (s.len >= max_arg_len) return Error.TooLarge;
+    // next 返回非 0 表示后面还有参数，而这个方法只收一个
+    if (c.dbus_message_iter_next(&it) != 0) return Error.Malformed;
 
-        @memcpy(out.storage[out.len][0..s.len], s);
-        out.storage[out.len][s.len] = 0;
-        out.args[out.len] = out.storage[out.len][0..s.len];
-        out.len += 1;
-
-        // next 返回 0 表示数组已经到头
-        if (c.dbus_message_iter_next(&sub) == 0) break;
-    }
+    if (s.len >= buf.len) return Error.TooLarge;
+    @memcpy(buf[0..s.len], s);
+    buf[s.len] = 0;
+    return buf[0..s.len :0];
 }

@@ -3,7 +3,7 @@
 //! 玲珑容器把 / 挂成只读 overlay，容器内的应用因此读不到宿主的
 //! /var/lib/linglong/states.json，也跑不动 ll-cli（缺宿主那套共享库）。
 //! 但容器与宿主共享 $HOME 和 session bus，所以应用可以放一份 D-Bus 服务文件，
-//! 由宿主的 bus 按需把本程序拉起来，替它做这两件事。
+//! 由宿主的 bus 按需把本程序拉起来，替它把这几件事做掉。
 //!
 //! D-Bus 用的是 libdbus（见 src/dbus.zig）—— 会话总线的服务激活路径
 //! 有一堆规范没写死、实现却必须照做的细节，自己重造划不来。
@@ -52,12 +52,11 @@ const ll_cli = "/usr/bin/ll-cli";
 const entries_apps = "/var/lib/linglong/entries/share/applications";
 const entries_icons = "/var/lib/linglong/entries/share/icons/hicolor";
 
-/// 允许经 D-Bus 触发的 ll-cli 子命令。全是只读查询，
-/// 挡的是 uninstall/install 这类会改系统状态的。
-const ll_allowed = [_][]const u8{ "list", "info", "search", "ps" };
-
 const max_states = 8 * 1024 * 1024;
-const max_output = 8 * 1024 * 1024;
+
+/// 应用 ID 的上限。正常就是 "org.example.App" 这种，长的也就
+/// "org.example.App/1.2.3/x86_64" 那样的完整引用，256 足够。
+const max_appid = 256;
 
 /// 单个 desktop 文件的上限。桌面条目就是几十行字，正常几百字节；
 /// 超了说明这个文件不是桌面条目，如实报错而不是截断着用。
@@ -71,8 +70,6 @@ const max_name = 256;
 // 缓冲放 .bss，不占二进制体积。末尾那一字节留给 NUL，
 // 因为 libdbus 追加字符串时靠 strlen 定长。
 var states_buf: [max_states]u8 = undefined;
-var out_buf: [max_output]u8 = undefined;
-var err_buf: [64 * 1024]u8 = undefined;
 var desktop_buf: [max_desktop]u8 = undefined;
 var icon_buf: [max_icon]u8 = undefined;
 /// 从 desktop 文本里取出来的应用 ID，抄一份补上 NUL 才能交给 libdbus。
@@ -93,6 +90,20 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         std.debug.print("linyapsd: 无法识别的参数 {s}\n用法: linyapsd [--version]\n", .{first});
         return 2;
     }
+
+    // LaunchApp 会 fork 出 ll-cli 就不再管它：应用要一直跑到用户关掉为止，
+    // 父进程不可能留在那儿 wait。可子进程退出时若没人收，就会变成僵尸进程
+    // 一直占着进程表。SIG_IGN 让内核直接代为收尸，省掉我们自己 wait 这件事。
+    // 本程序除此之外不 fork、也没有任何地方 wait，改这个处置不牵连别处。
+    //
+    // 这里走 std.posix 而不是 c.signal：musl 的 SIG_IGN 是个带函数指针强转的
+    // 宏（`((void (*)(int)) 1)`），translate-c 翻不动，会在 cimport 里直接
+    // 编译失败。std.posix 那套是 Zig 自己维护的，两种 libc 下都能用。
+    posix.sigaction(posix.SIG.CHLD, &.{
+        .handler = .{ .handler = posix.SIG.IGN },
+        .mask = std.mem.zeroes(posix.sigset_t),
+        .flags = 0,
+    }, null);
 
     const conn = dbus.connectSessionBus() catch |e| {
         std.debug.print("linyapsd: 连接 session bus 失败: {s} ({s})\n", .{ @errorName(e), dbus.lastError() });
@@ -270,8 +281,8 @@ fn dispatch(conn: dbus.Connection, call: dbus.Incoming) dbus.Error!bool {
         try handleReadStates(conn, call);
     } else if (std.mem.eql(u8, member, "ReadEntries")) {
         try handleReadEntries(conn, call);
-    } else if (std.mem.eql(u8, member, "ExecLlCli")) {
-        try handleExecLlCli(conn, call);
+    } else if (std.mem.eql(u8, member, "LaunchApp")) {
+        try handleLaunchApp(conn, call);
     } else if (std.mem.eql(u8, member, "Quit")) {
         // 退出本实例。部署方换上新版本后靠它让旧进程让位：文件换了可旧进程
         // 还占着 bus name 的话，调用照旧由它响应，换了等于没换。
@@ -521,155 +532,51 @@ fn copyZ(buf: []u8, s: []const u8) ![:0]const u8 {
     return buf[0..s.len :0];
 }
 
-/// 跑一个白名单内的 ll-cli 子命令，回 (退出码, stdout, stderr)。
-fn handleExecLlCli(conn: dbus.Connection, call: dbus.Incoming) dbus.Error!void {
-    var parsed: dbus.ArgList = .{};
-    // 参数表的问题分开说：畸形和超限是两回事，笼统回一句"解析失败"
-    // 会让调用方看不出是自己发错了还是参数太长。
-    dbus.readStringArray(call, &parsed) catch |e| return switch (e) {
-        error.TooLarge => dbus.replyError(conn, call, "org.freedesktop.DBus.Error.InvalidArgs", "参数过多或过长"),
-        else => dbus.replyError(conn, call, "org.freedesktop.DBus.Error.InvalidArgs", "参数表格式不合法"),
+/// 在宿主命名空间里跑 `ll-cli run <应用 ID>`，把这个玲珑应用拉起来。
+///
+/// 容器里跑不动 ll-cli（缺 libostree 等宿主库），所以"用玲珑应用打开东西"
+/// 这件事只能由宿主侧来做。ll-cli 跑起来就一直在前台待着，直到那个应用被关掉，
+/// 所以这里不可能同步地"跑完再回复" —— 分出去之后立刻回空串，不等它，
+/// 也没法报成功失败：真能说清楚成败，得等它跑到终点，那就等于把这次调用
+/// 挂上几个小时。失败信息由 ll-cli 自己写在本进程的 stderr 上（也就是 journal），
+/// 不经过返回值。
+fn handleLaunchApp(conn: dbus.Connection, call: dbus.Incoming) dbus.Error!void {
+    var launch_buf: [max_appid]u8 = undefined;
+    // 参数的问题分开说：畸形和超长是两回事，笼统回一句"解析失败"
+    // 会让调用方看不出是自己发错了还是应用 ID 太长
+    const appid = dbus.readSingleString(call, &launch_buf) catch |e| return switch (e) {
+        error.TooLarge => dbus.replyError(conn, call, "org.freedesktop.DBus.Error.InvalidArgs", "应用 ID 过长"),
+        else => dbus.replyError(conn, call, "org.freedesktop.DBus.Error.InvalidArgs", "参数格式不合法"),
     };
-
-    if (parsed.len == 0) {
-        return dbus.replyError(conn, call, "org.freedesktop.DBus.Error.InvalidArgs", "参数个数不合法");
-    }
-    const args = parsed.slice();
-
-    // 白名单只看第一个参数，也就是子命令本身
-    var allowed = false;
-    for (ll_allowed) |a| {
-        if (std.mem.eql(u8, args[0], a)) allowed = true;
-    }
-    if (!allowed) {
-        return dbus.replyError(conn, call, "org.freedesktop.DBus.Error.AccessDenied", "该子命令不在白名单内");
+    if (appid.len == 0) {
+        return dbus.replyError(conn, call, "org.freedesktop.DBus.Error.InvalidArgs", "应用 ID 不能为空");
     }
 
-    // 参数原样交给 execv，不经过 shell。storage 里已是 NUL 结尾。
-    var argv: [dbus.max_args + 2]?[*:0]const u8 = undefined;
-    argv[0] = ll_cli;
-    for (0..args.len) |i| {
-        argv[i + 1] = @ptrCast(&parsed.storage[i]);
-    }
-    argv[args.len + 1] = null;
-
-    // 末尾那个 null 就是 argv 的 sentinel，runLlCli 靠它知道参数到哪儿为止
-    const run = runLlCli(@ptrCast(&argv)) catch |e| return switch (e) {
-        error.SpawnFailed => dbus.replyError(conn, call, "org.freedesktop.DBus.Error.Failed", "无法执行 ll-cli"),
-        error.OutputTooLarge => dbus.replyError(conn, call, "org.freedesktop.DBus.Error.LimitsExceeded", "ll-cli 输出超出上限"),
-    };
-
-    out_buf[run.out_len] = 0;
-    err_buf[run.err_len] = 0;
-
-    var r = try dbus.newReply(call);
-    defer r.discard();
-    try dbus.putInt32(&r, run.code);
-    try dbus.putString(&r, out_buf[0..run.out_len :0]);
-    try dbus.putString(&r, err_buf[0..run.err_len :0]);
-    return dbus.sendReply(conn, &r);
-}
-
-const RunResult = struct {
-    code: i32,
-    out_len: usize,
-    err_len: usize,
-};
-
-const RunError = error{
-    /// 管道/派生/执行失败，ll-cli 根本没跑起来
-    SpawnFailed,
-    /// 输出撑满了缓冲。宁可如实失败，也不把截断过的半截输出当成完整结果回给调用方
-    OutputTooLarge,
-};
-
-/// argv 以 null 收尾，形参的 sentinel 就是这个 null —— 类型本身保证了
-/// execv 要的那个结尾，不用再传一个容易算错的长度。
-fn runLlCli(argv: [*:null]const ?[*:0]const u8) RunError!RunResult {
-    var out_pipe: [2]c_int = undefined;
-    var err_pipe: [2]c_int = undefined;
-    if (c.pipe(&out_pipe) != 0) return error.SpawnFailed;
-    if (c.pipe(&err_pipe) != 0) {
-        _ = c.close(out_pipe[0]);
-        _ = c.close(out_pipe[1]);
-        return error.SpawnFailed;
-    }
+    // "--" 是给 ll-cli 的选项隔断：应用 ID 完全由调用方给，开头要是带个 -
+    // 不加它就进了 ll-cli 的选项解析（`ll-cli run --help` 打的是它自己的用法），
+    // 加了之后后面那个词无论长什么样都只当应用 ID —— 不接受的应用 ID
+    // 一律得到"包不存在"，不会变成别的东西。末尾那个 null 是 execv 要的结尾。
+    var argv: [5]?[*:0]const u8 = .{ ll_cli, "run", "--", appid.ptr, null };
 
     const pid = c.fork();
     if (pid < 0) {
-        // 还没到 errdefer 那一段（它是 fork 之后才装的），四个 fd 都还开着
-        _ = c.close(out_pipe[0]);
-        _ = c.close(out_pipe[1]);
-        _ = c.close(err_pipe[0]);
-        _ = c.close(err_pipe[1]);
-        return error.SpawnFailed;
+        return dbus.replyError(conn, call, "org.freedesktop.DBus.Error.Failed", "fork 失败");
     }
 
     if (pid == 0) {
-        _ = c.close(out_pipe[0]);
-        _ = c.close(err_pipe[0]);
-        _ = c.dup2(out_pipe[1], 1);
-        _ = c.dup2(err_pipe[1], 2);
-        _ = c.close(out_pipe[1]);
-        _ = c.close(err_pipe[1]);
+        // 另立会话：本实例随时可能因为"调用方都走了"收工，
+        // 不该把已经交出去的应用一起带走
+        _ = c.setsid();
         // translate-c 把 execv 的形参翻成了 [*c]const [*c]u8，把我们的数组直接投过去
-        const cargv: [*c]const [*c]u8 = @ptrCast(@constCast(argv));
+        const cargv: [*c]const [*c]u8 = @ptrCast(@constCast(&argv));
         _ = c.execv(ll_cli, cargv);
+        // execv 成功就不会回到这儿。回来了说明 ll-cli 根本没起来，
+        // 而回复早就发出去了，只能让它落到本进程的 stderr 上
+        std.debug.print("linyapsd: 执行 {s} 失败，应用 {s} 没能启动\n", .{ ll_cli, appid });
         c._exit(127);
     }
 
-    _ = c.close(out_pipe[1]);
-    _ = c.close(err_pipe[1]);
-
-    // 后面无论哪一步失败，子进程和两个管道都要收干净再往上抛。
-    // errdefer 管的是失败路径，正常路径在函数末尾自己收。
-    errdefer {
-        _ = c.kill(pid, c.SIGKILL);
-        _ = c.waitpid(pid, null, 0);
-        _ = c.close(out_pipe[0]);
-        _ = c.close(err_pipe[0]);
-    }
-
-    var out_len: usize = 0;
-    var err_len: usize = 0;
-    var out_open = true;
-    var err_open = true;
-
-    // 两个管道一起等，避免一边写满阻塞而另一边没人读。
-    // 各留一字节给结尾的 NUL。
-    while (out_open or err_open) {
-        var fds = [2]posix.pollfd{
-            .{ .fd = out_pipe[0], .events = posix.POLL.IN, .revents = 0 },
-            .{ .fd = err_pipe[0], .events = posix.POLL.IN, .revents = 0 },
-        };
-        // 连管道都等不了了，剩下多少读多少没有意义，如实报错
-        _ = posix.poll(&fds, -1) catch return error.SpawnFailed;
-
-        if (out_open and (fds[0].revents & (posix.POLL.IN | posix.POLL.HUP)) != 0) {
-            const dst = out_buf[out_len .. out_buf.len - 1];
-            if (dst.len == 0) return error.OutputTooLarge;
-            const n = c.read(out_pipe[0], dst.ptr, dst.len);
-            if (n > 0) out_len += @intCast(n) else out_open = false;
-        }
-        if (err_open and (fds[1].revents & (posix.POLL.IN | posix.POLL.HUP)) != 0) {
-            const dst = err_buf[err_len .. err_buf.len - 1];
-            if (dst.len == 0) return error.OutputTooLarge;
-            const n = c.read(err_pipe[0], dst.ptr, dst.len);
-            if (n > 0) err_len += @intCast(n) else err_open = false;
-        }
-    }
-    _ = c.close(out_pipe[0]);
-    _ = c.close(err_pipe[0]);
-
-    var status: c_int = 0;
-    _ = c.waitpid(pid, &status, 0);
-
-    var code: i32 = -1;
-    if (c.WIFEXITED(status)) {
-        code = c.WEXITSTATUS(status);
-    } else if (c.WIFSIGNALED(status)) {
-        code = -c.WTERMSIG(status);
-    }
-
-    return .{ .code = code, .out_len = out_len, .err_len = err_len };
+    // 不回退出码，也不等：请 ll-cli 把应用拉起来就算完事。
+    // 回空串是明说"这个方法没有结果可报"，不是"成功了"
+    try replyString(conn, call, "");
 }
