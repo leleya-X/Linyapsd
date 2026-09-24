@@ -2,7 +2,7 @@
     .name = .linyapsd,
     // 版本号的真源。源码不再另写一份，由 build.zig 读出来注入，
     // 减少一处"两份对不上但没人发现"的机会
-    .version = "0.0.19",
+    .version = "0.0.18",
     // 改这个字段有安全和信任含义，别动
     .fingerprint = 0xa3d2f87d46c051f5,
     .minimum_zig_version = "0.16.0",
